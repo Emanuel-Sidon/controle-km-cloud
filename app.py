@@ -17,7 +17,7 @@ st.markdown("""
 <style>
 .main-header {font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem;}
 .metric-card {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 1rem; color: white; text-align: center;}
-.warning-box {background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0;}
+.warning-box {background-color: #f9f9f9; border-left: 4px solid #a2a2a2a2; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; color: #000000;}
 .success-box {background-color: #d4edda; border-left: 4px solid #28a745; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0;}
 .email-box {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 1rem; color: white; margin: 1rem 0;}
 </style>
