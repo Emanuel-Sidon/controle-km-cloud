@@ -10,6 +10,7 @@ from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
 import zipfile
+import shutil
 
 st.set_page_config(page_title="Controle de KM - Ônibus", page_icon="🚌", layout="wide")
 
@@ -17,20 +18,28 @@ st.markdown("""
 <style>
 .main-header {font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem;}
 .metric-card {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 1rem; color: white; text-align: center;}
-.warning-box {background-color: #f9f9f9; border-left: 4px solid #a2a2a2a2; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; color: #000000;}
+.warning-box {background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; color: #000000;}
 .success-box {background-color: #d4edda; border-left: 4px solid #28a745; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0;}
 .email-box {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; border-radius: 1rem; color: white; margin: 1rem 0;}
 </style>
 """, unsafe_allow_html=True)
 
-DATA_FILE = "dados_viagens.json"
-PHOTOS_DIR = "fotos_evidencias"
-EMAIL_CONFIG_FILE = "email_config.json"
+# ==================== CONFIGURAÇÃO DE PASTAS ====================
+# Detectar ambiente (local vs cloud)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "dados_viagens.json")
+PHOTOS_DIR = os.path.join(BASE_DIR, "fotos_evidencias")
+EMAIL_CONFIG_FILE = os.path.join(BASE_DIR, "email_config.json")
+
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 
 TURNOS = ["ADM", "A", "B", "C"]
 DIAS_SEMANA = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
 MESES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+
+st.sidebar.markdown(f"<div style='font-size: 0.7rem; color: gray;'>📁 Dados: {BASE_DIR}</div>", unsafe_allow_html=True)
+
+# ==================== FUNÇÕES DE PERSISTÊNCIA ====================
 
 def carregar_dados():
     if os.path.exists(DATA_FILE):
@@ -53,6 +62,7 @@ def salvar_config_email(config):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 def salvar_foto(uploaded_file, nome_arquivo):
+    """Salva foto e retorna caminho relativo para portabilidade"""
     if uploaded_file is not None:
         caminho = os.path.join(PHOTOS_DIR, nome_arquivo)
         with open(caminho, "wb") as f:
@@ -60,28 +70,47 @@ def salvar_foto(uploaded_file, nome_arquivo):
         return caminho
     return None
 
-def adicionar_viagem(data_viagem, turno, numero_onibus, km_inicial, km_final, passageiros, observacao="", foto_inicial=None, foto_final=None):
+def adicionar_viagem(data_viagem, turno, numero_onibus, km_inicial, km_final, passageiros, 
+                     observacao="", foto_inicial=None, foto_final=None):
     dados = carregar_dados()
     dt = pd.to_datetime(data_viagem)
     dia_semana = DIAS_SEMANA[dt.weekday()]
     mes_nome = MESES[dt.month - 1]
     novo_id = len(dados) + 1
+
     foto_inicial_path = None
     foto_final_path = None
+
     if foto_inicial is not None:
         ext = foto_inicial.name.split('.')[-1]
         foto_inicial_path = salvar_foto(foto_inicial, f"viagem_{novo_id}_inicial.{ext}")
+
     if foto_final is not None:
         ext = foto_final.name.split('.')[-1]
         foto_final_path = salvar_foto(foto_final, f"viagem_{novo_id}_final.{ext}")
+
     viagem = {
-        "id": novo_id, "data": str(data_viagem), "dia_semana": dia_semana, "semana_ano": dt.isocalendar()[1],
-        "mes": dt.month, "mes_nome": mes_nome, "ano": dt.year, "turno": turno, "numero_onibus": numero_onibus,
-        "km_inicial": float(km_inicial), "km_final": float(km_final), "km_percorrido": round(float(km_final) - float(km_inicial), 2),
-        "passageiros": int(passageiros), "observacao": observacao, "tem_foto_inicial": foto_inicial_path is not None,
-        "tem_foto_final": foto_final_path is not None, "foto_inicial": foto_inicial_path, "foto_final": foto_final_path,
+        "id": novo_id,
+        "data": str(data_viagem),
+        "dia_semana": dia_semana,
+        "semana_ano": dt.isocalendar()[1],
+        "mes": dt.month,
+        "mes_nome": mes_nome,
+        "ano": dt.year,
+        "turno": turno,
+        "numero_onibus": numero_onibus,
+        "km_inicial": float(km_inicial),
+        "km_final": float(km_final),
+        "km_percorrido": round(float(km_final) - float(km_inicial), 2),
+        "passageiros": int(passageiros),
+        "observacao": observacao,
+        "tem_foto_inicial": foto_inicial_path is not None,
+        "tem_foto_final": foto_final_path is not None,
+        "foto_inicial": foto_inicial_path,
+        "foto_final": foto_final_path,
         "data_registro": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
+
     dados.append(viagem)
     salvar_dados(dados)
     return viagem
@@ -107,62 +136,153 @@ def df_viagens():
     df["data"] = pd.to_datetime(df["data"])
     return df
 
+# ==================== FUNÇÕES DE E-MAIL E ZIP ====================
+
+def verificar_fotos_existentes(df_periodo):
+    """Verifica quais fotos realmente existem no disco"""
+    fotos_existentes = []
+    for _, row in df_periodo.iterrows():
+        if row.get("foto_inicial") and os.path.exists(row["foto_inicial"]):
+            fotos_existentes.append({
+                "id": row["id"],
+                "tipo": "inicial",
+                "caminho": row["foto_inicial"],
+                "onibus": row["numero_onibus"],
+                "data": row["data"]
+            })
+        if row.get("foto_final") and os.path.exists(row["foto_final"]):
+            fotos_existentes.append({
+                "id": row["id"],
+                "tipo": "final",
+                "caminho": row["foto_final"],
+                "onibus": row["numero_onibus"],
+                "data": row["data"]
+            })
+    return fotos_existentes
+
 def criar_relatorio_zip(data_inicio=None, data_fim=None, incluir_fotos=True):
+    """Cria um ZIP com relatório Excel + fotos de evidência"""
     df = df_viagens()
+
     if data_inicio and data_fim:
         df = df[(df["data"].dt.date >= data_inicio) & (df["data"].dt.date <= data_fim)]
+
     if df.empty:
         return None, "Nenhum dado para exportar."
+
     buffer = BytesIO()
+
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # 1. Relatório Excel com múltiplas abas
         excel_buffer = BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            # Aba 1: Viagens completas
             df.to_excel(writer, sheet_name='Viagens', index=False)
-            resumo_dia_turno = df.groupby([df["data"].dt.date, "turno"]).agg({"km_percorrido": "sum", "passageiros": "sum", "numero_onibus": "nunique", "id": "count"}).rename(columns={"numero_onibus": "onibus_unicos", "id": "viagens"})
+
+            # Aba 2: Resumo por Dia e Turno
+            resumo_dia_turno = df.groupby([df["data"].dt.date, "turno"]).agg({
+                "km_percorrido": "sum",
+                "passageiros": "sum",
+                "numero_onibus": "nunique",
+                "id": "count"
+            }).rename(columns={"numero_onibus": "onibus_unicos", "id": "viagens"})
             resumo_dia_turno.columns = ["KM Total", "Passageiros", "Ônibus Únicos", "Viagens"]
             resumo_dia_turno.to_excel(writer, sheet_name='Resumo Dia-Turno')
-            resumo_onibus = df.groupby("numero_onibus").agg({"km_percorrido": ["sum", "mean", "count"], "passageiros": "sum", "data": ["min", "max"]})
+
+            # Aba 3: Resumo por Ônibus
+            resumo_onibus = df.groupby("numero_onibus").agg({
+                "km_percorrido": ["sum", "mean", "count"],
+                "passageiros": "sum",
+                "data": ["min", "max"]
+            })
             resumo_onibus.columns = ["KM Total", "KM Médio", "Viagens", "Passageiros", "Primeira Viagem", "Última Viagem"]
             resumo_onibus.sort_values("KM Total", ascending=False).to_excel(writer, sheet_name='Resumo Ônibus')
-            resumo_mensal = df.groupby(["mes", "mes_nome"]).agg({"km_percorrido": ["sum", "mean"], "passageiros": ["sum", "mean"], "numero_onibus": "nunique", "id": "count"})
+
+            # Aba 4: Resumo Mensal
+            resumo_mensal = df.groupby(["mes", "mes_nome"]).agg({
+                "km_percorrido": ["sum", "mean"],
+                "passageiros": ["sum", "mean"],
+                "numero_onibus": "nunique",
+                "id": "count"
+            })
             resumo_mensal.columns = ["KM Total", "KM Médio/Viagem", "Passageiros", "Pass Médio/Viagem", "Ônibus Únicos", "Total Viagens"]
             resumo_mensal.reset_index().set_index("mes_nome").to_excel(writer, sheet_name='Resumo Mensal')
+
+            # Aba 5: Resumo por Dia da Semana
+            resumo_dia_sem = df.groupby("dia_semana").agg({
+                "km_percorrido": ["sum", "mean"],
+                "passageiros": ["sum", "mean"],
+                "id": "count"
+            })
+            resumo_dia_sem.columns = ["KM Total", "KM Médio", "Pass Total", "Pass Médio", "Viagens"]
+            resumo_dia_sem.to_excel(writer, sheet_name='Resumo Dia Semana')
+
         zf.writestr("relatorio_km.xlsx", excel_buffer.getvalue())
+
+        # 2. Fotos de evidência (SEMPRE verificar se existem)
         if incluir_fotos:
-            fotos_adicionadas = 0
-            for _, row in df.iterrows():
-                if row.get("foto_inicial") and os.path.exists(row["foto_inicial"]):
-                    zf.write(row["foto_inicial"], f"fotos/{row['id']}_inicial_{os.path.basename(row['foto_inicial'])}")
-                    fotos_adicionadas += 1
-                if row.get("foto_final") and os.path.exists(row["foto_final"]):
-                    zf.write(row["foto_final"], f"fotos/{row['id']}_final_{os.path.basename(row['foto_final'])}")
-                    fotos_adicionadas += 1
-            if fotos_adicionadas == 0:
-                zf.writestr("fotos/SEM_FOTOS.txt", "Nenhuma foto de evidência registrada neste período.")
+            fotos_encontradas = verificar_fotos_existentes(df)
+
+            if fotos_encontradas:
+                # Criar índice de fotos
+                indice_fotos = []
+                for foto in fotos_encontradas:
+                    nome_arquivo = f"viagem_{foto['id']}_{foto['tipo']}_{os.path.basename(foto['caminho'])}"
+                    zf.write(foto['caminho'], f"fotos_evidencias/{nome_arquivo}")
+                    indice_fotos.append({
+                        "Viagem ID": foto['id'],
+                        "Data": foto['data'].strftime('%d/%m/%Y') if hasattr(foto['data'], 'strftime') else str(foto['data']),
+                        "Ônibus": foto['onibus'],
+                        "Tipo": "KM Inicial" if foto['tipo'] == "inicial" else "KM Final",
+                        "Arquivo": nome_arquivo
+                    })
+
+                # Adicionar índice de fotos como CSV dentro do ZIP
+                if indice_fotos:
+                    df_indice = pd.DataFrame(indice_fotos)
+                    zf.writestr("fotos_evidencias/INDICE_FOTOS.csv", df_indice.to_csv(index=False))
+            else:
+                zf.writestr("fotos_evidencias/README.txt", 
+                    "Nenhuma foto de evidência foi encontrada para o período selecionado.\n\n"
+                    "Possíveis motivos:\n"
+                    "1. As viagens não tinham fotos anexadas\n"
+                    "2. As fotos foram perdidas devido a reinicialização do servidor (modo cloud)\n"
+                    "3. O período selecionado não possui registros com fotos\n\n"
+                    "DICA: No modo cloud, envie o relatório imediatamente após cadastrar as fotos!"
+                )
+
     buffer.seek(0)
     return buffer, None
 
-def enviar_email(destinatario, assunto, corpo, anexo_buffer=None, anexo_nome="relatorio.zip", smtp_server="smtp.gmail.com", smtp_port=587, email_remetente=None, senha_app=None):
+def enviar_email(destinatario, assunto, corpo, anexo_buffer=None, anexo_nome="relatorio.zip",
+                 smtp_server="smtp.gmail.com", smtp_port=587, email_remetente=None, senha_app=None):
+    """Envia e-mail com anexo ZIP"""
     try:
         msg = MIMEMultipart()
         msg['From'] = email_remetente
         msg['To'] = destinatario
         msg['Subject'] = assunto
+
         msg.attach(MIMEText(corpo, 'plain', 'utf-8'))
+
         if anexo_buffer:
             part = MIMEBase('application', 'zip')
             part.set_payload(anexo_buffer.getvalue())
             encoders.encode_base64(part)
             part.add_header('Content-Disposition', f'attachment; filename= {anexo_nome}')
             msg.attach(part)
+
         server = smtplib.SMTP(smtp_server, smtp_port)
         server.starttls()
         server.login(email_remetente, senha_app)
         server.send_message(msg)
         server.quit()
+
         return True, "E-mail enviado com sucesso!"
     except Exception as e:
         return False, f"Erro ao enviar e-mail: {str(e)}"
+
+# ==================== FUNÇÕES DE ANÁLISE TEMPORAL ====================
 
 def get_semana_atual(): return date.today().isocalendar()[1]
 def get_mes_atual(): return date.today().month
@@ -183,7 +303,8 @@ def comparacao_mensal(df):
     return {"atual_km": df_atual["km_percorrido"].sum() if not df_atual.empty else 0, "anterior_km": df_anterior["km_percorrido"].sum() if not df_anterior.empty else 0, "atual_viagens": len(df_atual), "anterior_viagens": len(df_anterior), "atual_passageiros": df_atual["passageiros"].sum() if not df_atual.empty else 0, "anterior_passageiros": df_anterior["passageiros"].sum() if not df_anterior.empty else 0}
 
 def tendencia_ultimos_dias(df, dias=7):
-    hoje, data_limite = pd.Timestamp.now(), pd.Timestamp.now() - timedelta(days=dias)
+    hoje = pd.Timestamp.now()
+    data_limite = hoje - timedelta(days=dias)
     df_periodo = df[df["data"] >= data_limite]
     if df_periodo.empty: return pd.DataFrame()
     return df_periodo.groupby(df_periodo["data"].dt.date).agg({"km_percorrido": "sum", "passageiros": "sum", "id": "count"}).rename(columns={"id": "viagens"})
@@ -206,14 +327,14 @@ if dados:
 else:
     st.sidebar.info("Nenhuma viagem registrada ainda.")
 
-# ==================== AVISO CLOUD ====================
+# ==================== DASHBOARD ====================
 if pagina == "🏠 Dashboard":
     st.markdown('<div class="main-header">🚌 Controle de KM Rodado</div>', unsafe_allow_html=True)
     st.markdown("""
     <div class="warning-box">
     <strong>⚠️ Modo Cloud Ativo</strong><br>
     Este app está rodando na nuvem (Render). Os dados são <strong>temporários</strong> e serão perdidos quando o app reiniciar.<br>
-    <strong>Recomendação:</strong> Envie o relatório por e-mail regularmente para preservar seus dados e fotos!
+    <strong>Recomendação:</strong> Envie o relatório por e-mail <strong>imediatamente</strong> após cadastrar as fotos!
     </div>
     """, unsafe_allow_html=True)
 
@@ -229,6 +350,7 @@ if pagina == "🏠 Dashboard":
         df = df_viagens()
         hoje = pd.Timestamp.now().date()
         df_hoje = df[df["data"].dt.date == hoje]
+
         col1, col2, col3, col4 = st.columns(4)
         with col1: st.markdown(f'<div class="metric-card"><div style="font-size: 2rem; font-weight: bold;">{len(df_hoje)}</div><div>Viagens Hoje</div></div>', unsafe_allow_html=True)
         with col2: st.markdown(f'<div class="metric-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);"><div style="font-size: 2rem; font-weight: bold;">{df_hoje["km_percorrido"].sum():,.1f} km</div><div>KM Hoje</div></div>', unsafe_allow_html=True)
@@ -270,20 +392,29 @@ if pagina == "🏠 Dashboard":
         km_por_onibus.columns = ["KM Total", "Passageiros", "Viagens"]
         st.dataframe(km_por_onibus, use_container_width=True)
 
-        st.subheader("📝 Últimas 10 Viagens")
+        st.subheader("📝 Últimas 10 Viagens Registradas")
         df_display = df.sort_values("id", ascending=False).head(10)[["data", "dia_semana", "turno", "numero_onibus", "km_percorrido", "passageiros", "tem_foto_inicial", "tem_foto_final"]]
         df_display.columns = ["Data", "Dia", "Turno", "Ônibus", "KM", "Passageiros", "📸 Inicial", "📸 Final"]
         st.dataframe(df_display, use_container_width=True, hide_index=True)
 
         st.markdown("---")
         st.subheader("📧 Enviar Relatório Rápido")
-        st.warning("⚠️ Lembre-se: os dados são temporários na nuvem. Envie por e-mail para preservar!")
-        if st.button("🚀 Enviar Últimos Dados por E-mail", use_container_width=True, type="primary"):
-            st.info("Vá para a aba '📧 Enviar por E-mail' para configurar e enviar o relatório completo.")
+        st.warning("⚠️ IMPORTANTE: No modo cloud, envie o relatório IMEDIATAMENTE após cadastrar as fotos, antes que o app reinicie!")
+        if st.button("🚀 Ir para Envio de E-mail", use_container_width=True, type="primary"):
+            st.info("Vá para a aba '📧 Enviar por E-mail' para configurar e enviar o relatório completo com fotos.")
 
 # ==================== NOVA VIAGEM ====================
 elif pagina == "➕ Nova Viagem":
     st.markdown('<div class="main-header">➕ Registrar Nova Viagem</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="warning-box">
+    <strong>💡 Dica do Modo Cloud:</strong><br>
+    Após cadastrar esta viagem e suas fotos, vá imediatamente para <strong>"📧 Enviar por E-mail"</strong> 
+    e envie o relatório. As fotos são temporárias e podem ser perdidas se o app reiniciar!
+    </div>
+    """, unsafe_allow_html=True)
+
     with st.form("form_viagem", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
@@ -296,8 +427,8 @@ elif pagina == "➕ Nova Viagem":
             passageiros = st.number_input("👥 Quantidade de Passageiros", min_value=0, step=1)
         observacao = st.text_area("📝 Observação (opcional)", placeholder="Alguma observação sobre a viagem...")
         st.markdown("---")
-        st.markdown("### 📸 Fotos de Evidência (Opcional)")
-        st.info("Tire fotos do hodômetro para comprovar os valores de KM inicial e final.")
+        st.markdown("### 📸 Fotos de Evidência (IMPORTANTE - Serão enviadas por e-mail)")
+        st.info("Tire fotos do hodômetro. Elas serão incluídas no ZIP enviado por e-mail.")
         col_f1, col_f2 = st.columns(2)
         with col_f1:
             foto_inicial = st.file_uploader("📷 Foto do KM INICIAL", type=["jpg", "jpeg", "png"], key="foto_ini")
@@ -318,7 +449,15 @@ elif pagina == "➕ Nova Viagem":
                 msg_foto = ""
                 if viagem["tem_foto_inicial"]: msg_foto += " 📸 Foto inicial salva!"
                 if viagem["tem_foto_final"]: msg_foto += " 📸 Foto final salva!"
-                st.success(f"✅ Viagem #{viagem['id']} registrada! | {viagem['dia_semana']}, Sem {viagem['semana_ano']} | KM: {viagem['km_percorrido']:,.2f}{msg_foto}")
+                st.success(f"✅ Viagem #{viagem['id']} registrada!{msg_foto}")
+                st.markdown("""
+                <div class="success-box">
+                <strong>✅ Viagem salva com sucesso!</strong><br>
+                <strong>⚠️ PRÓXIMO PASSO IMPORTANTE:</strong><br>
+                Vá para a aba <strong>"📧 Enviar por E-mail"</strong> e envie o relatório AGORA para preservar as fotos!<br>
+                No modo cloud, as fotos podem ser perdidas se o app reiniciar.
+                </div>
+                """, unsafe_allow_html=True)
                 st.balloons()
 
 # ==================== RELATÓRIOS ====================
@@ -461,13 +600,29 @@ elif pagina == "📧 Enviar por E-mail":
         <p><strong>Importante:</strong> No modo cloud, os dados são temporários. Envie regularmente!</p>
         </div>
         """, unsafe_allow_html=True)
+
+        # Verificar fotos disponíveis
+        fotos_disp = verificar_fotos_existentes(df)
+        st.markdown("---")
+        st.subheader("📸 Status das Fotos")
+        if fotos_disp:
+            st.success(f"✅ {len(fotos_disp)} fotos de evidência encontradas no servidor e prontas para envio!")
+            with st.expander("Ver lista de fotos disponíveis"):
+                for f in fotos_disp:
+                    st.write(f"   • Viagem #{f['id']} - {f['onibus']} - {f['tipo']} - {os.path.basename(f['caminho'])}")
+        else:
+            st.error("❌ NENHUMA foto encontrada no servidor!")
+            st.info("💡 Se você acabou de cadastrar fotos, elas ainda estão aqui. Envie o relatório AGORA antes que o app reinicie!")
+
+        st.markdown("---")
         st.markdown("""
         <div class="warning-box">
-        <strong>💡 Dica de Segurança:</strong><br>
+        <strong>🔐 Configuração de E-mail:</strong><br>
         Use <strong>Senha de App</strong> do Gmail/Outlook, não sua senha normal.<br>
         Gmail: Configurações → Segurança → Verificação em 2 etapas → Senhas de app
         </div>
         """, unsafe_allow_html=True)
+
         st.subheader("⚙️ Configuração do E-mail")
         config = carregar_config_email()
         with st.expander("Configurar E-mail Remetente (salvo localmente)"):
@@ -484,6 +639,7 @@ elif pagina == "📧 Enviar por E-mail":
                     salvar_config_email({"email": email_remetente, "senha": senha_app, "smtp": smtp_server, "porta": smtp_port})
                     st.success("✅ Configuração salva! (Armazenada localmente)")
                 else: st.error("❌ Preencha e-mail e senha.")
+
         st.markdown("---")
         st.subheader("📅 Período do Relatório")
         col_p1, col_p2 = st.columns(2)
@@ -492,6 +648,7 @@ elif pagina == "📧 Enviar por E-mail":
         st.subheader("📎 Opções do Anexo")
         incluir_fotos = st.checkbox("📸 Incluir fotos de evidência no ZIP", value=True)
         df_periodo = df[(df["data"].dt.date >= data_inicio) & (df["data"].dt.date <= data_fim)]
+
         st.markdown("---")
         st.subheader("📊 Resumo do Período Selecionado")
         col_pr1, col_pr2, col_pr3, col_pr4 = st.columns(4)
@@ -499,11 +656,20 @@ elif pagina == "📧 Enviar por E-mail":
         with col_pr2: st.metric("KM Total", f"{df_periodo['km_percorrido'].sum():,.2f}")
         with col_pr3: st.metric("Passageiros", f"{df_periodo['passageiros'].sum():,}")
         with col_pr4: st.metric("Fotos", int(df_periodo["tem_foto_inicial"].sum() + df_periodo["tem_foto_final"].sum()))
+
+        # Verificar fotos reais do período
+        fotos_periodo = verificar_fotos_existentes(df_periodo)
+        if fotos_periodo:
+            st.success(f"✅ {len(fotos_periodo)} fotos reais encontradas e serão incluídas no ZIP!")
+        else:
+            st.warning("⚠️ Nenhuma foto física encontrada para este período. O ZIP conterá apenas o Excel.")
+
         st.markdown("---")
         st.subheader("📧 Enviar Relatório")
         destinatario = st.text_input("📧 E-mail do Destinatário", placeholder="chefe@empresa.com.br")
         if config.get("email"): st.info(f"📤 Enviando de: **{config['email']}**")
         else: st.warning("⚠️ Configure o e-mail remetente acima primeiro!")
+
         if st.button("🚀 Gerar ZIP e Enviar E-mail", use_container_width=True, type="primary"):
             if not destinatario: st.error("❌ Informe o e-mail do destinatário!")
             elif not config.get("email") or not config.get("senha"): st.error("❌ Configure o e-mail remetente primeiro!")
@@ -513,13 +679,22 @@ elif pagina == "📧 Enviar por E-mail":
                     if erro: st.error(f"❌ {erro}")
                     else:
                         st.success("✅ ZIP gerado com sucesso!")
-                        st.info(f"📦 Tamanho do anexo: **{len(zip_buffer.getvalue()) / 1024:,.1f} KB**")
+                        tamanho_kb = len(zip_buffer.getvalue()) / 1024
+                        st.info(f"📦 Tamanho do anexo: **{tamanho_kb:,.1f} KB**")
+
+                        # Listar conteúdo do ZIP
                         with zipfile.ZipFile(zip_buffer, 'r') as zf:
                             arquivos = zf.namelist()
                             st.write("📁 Arquivos no ZIP:")
-                            for arq in arquivos[:10]: st.write(f"   • {arq}")
-                            if len(arquivos) > 10: st.write(f"   ... e mais {len(arquivos)-10} arquivos")
+                            for arq in arquivos[:15]: st.write(f"   • {arq}")
+                            if len(arquivos) > 15: st.write(f"   ... e mais {len(arquivos)-15} arquivos")
+                            # Contar fotos
+                            fotos_no_zip = [a for a in arquivos if a.startswith("fotos_evidencias/") and not a.endswith("README.txt") and not a.endswith("INDICE_FOTOS.csv")]
+                            if fotos_no_zip: st.success(f"📸 {len(fotos_no_zip)} fotos incluídas no ZIP!")
+                            else: st.warning("⚠️ Nenhuma foto no ZIP (apenas relatório Excel)")
+
                         zip_buffer.seek(0)
+
                         with st.spinner("📧 Enviando e-mail..."):
                             assunto = f"Relatório de KM - {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
                             corpo = f"""Olá,
@@ -530,23 +705,31 @@ Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}
 Total de Viagens: {len(df_periodo)}
 KM Total: {df_periodo['km_percorrido'].sum():,.2f} km
 Passageiros: {df_periodo['passageiros'].sum():,}
+Fotos de evidência: {len(fotos_periodo)}
+
+O ZIP contém:
+- relatorio_km.xlsx (5 abas com análises)
+- fotos_evidencias/ (fotos do hodômetro)
+- INDICE_FOTOS.csv (lista organizada das fotos)
 
 Relatório gerado automaticamente pelo sistema de controle de KM.
 """
+
                             sucesso, msg = enviar_email(destinatario, assunto, corpo, zip_buffer, f"relatorio_km_{data_inicio}_{data_fim}.zip", config.get("smtp", "smtp.gmail.com"), config.get("porta", 587), config.get("email"), config.get("senha"))
                             if sucesso:
                                 st.success(f"✅ {msg}")
                                 st.markdown("""
                                 <div class="success-box">
                                 <strong>📧 E-mail enviado com sucesso!</strong><br>
-                                O relatório e as fotos estão salvos no seu e-mail.<br>
-                                <strong>Próximo passo:</strong> Baixe o ZIP no seu PC para preservar como evidência!
+                                O relatório e as fotos estão no seu e-mail.<br>
+                                <strong>Próximo passo:</strong> Baixe o ZIP no PC e salve como evidência permanente!
                                 </div>
                                 """, unsafe_allow_html=True)
                                 st.balloons()
                             else:
                                 st.error(f"❌ {msg}")
-                                st.info("💡 Dica: Se usar Gmail, ative 'Senha de App' em: Configurações → Segurança → Verificação em 2 etapas → Senhas de app")
+                                st.info("💡 Dica: Verifique se a 'Senha de App' está correta e se o servidor SMTP está correto.")
+
         st.markdown("---")
         st.subheader("💾 Ou Baixar ZIP Manualmente")
         if st.button("📥 Baixar Relatório ZIP", use_container_width=True):
@@ -629,4 +812,4 @@ elif pagina == "🗂️ Dados Completos":
                 st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("<div style='text-align: center; color: gray; font-size: 0.8rem;'>🚌 Controle de KM Cloud v1.0 - Render Ready</div>", unsafe_allow_html=True)
+st.sidebar.markdown("<div style='text-align: center; color: gray; font-size: 0.8rem;'>🚌 Controle de KM Cloud v2.0 - Fotos Corrigidas</div>", unsafe_allow_html=True)
