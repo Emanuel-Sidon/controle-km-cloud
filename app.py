@@ -4,13 +4,14 @@ from datetime import datetime, date, timedelta
 import json
 import os
 from io import BytesIO
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
 import zipfile
-import shutil
+import logging
+from PIL import Image
+
+import storage
+import utils
+import validations as val
+import email_service
 
 st.set_page_config(page_title="Controle de KM - Ônibus", page_icon="🚌", layout="wide")
 
@@ -39,248 +40,113 @@ MESES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "A
 
 st.sidebar.markdown(f"<div style='font-size: 0.7rem; color: gray;'>📁 Dados: {BASE_DIR}</div>", unsafe_allow_html=True)
 
-# ==================== FUNÇÕES DE PERSISTÊNCIA ====================
-
+# Use camada de storage unificada (D1 quando disponível, fallback local)
 def carregar_dados():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return []
+    return storage.carregar_dados()
 
-def salvar_dados(dados):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(dados, f, ensure_ascii=False, indent=2)
 
-def carregar_config_email():
+def df_viagens():
+    return storage.df_viagens()
+
+
+def excluir_viagem(id_viagem):
+    return storage.excluir_viagem(id_viagem)
+
+
+EMAIL_CONFIG_FILE = os.path.join(BASE_DIR, "email_config.json")
+
+
+def carregar_config_email() -> dict:
+    """Carrega configuração de e-mail (NÃO armazena senha no disco)."""
     if os.path.exists(EMAIL_CONFIG_FILE):
-        with open(EMAIL_CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(EMAIL_CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                cfg.pop("senha", None)
+                return cfg
+        except Exception:
+            return {}
     return {}
 
-def salvar_config_email(config):
-    with open(EMAIL_CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
 
-def salvar_foto(uploaded_file, nome_arquivo):
-    """Salva foto e retorna caminho relativo para portabilidade"""
-    if uploaded_file is not None:
-        caminho = os.path.join(PHOTOS_DIR, nome_arquivo)
-        with open(caminho, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        return caminho
-    return None
+def salvar_config_email(config: dict) -> None:
+    """Salva apenas meta (email remetente, smtp, porta) sem a senha."""
+    cfg = {k: v for k, v in config.items() if k in ("email", "smtp", "porta")}
+    try:
+        with open(EMAIL_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger = logging.getLogger(__name__)
+        logger.exception("Falha ao salvar configuração de e-mail local.")
 
-def adicionar_viagem(data_viagem, turno, numero_onibus, km_inicial, km_final, passageiros, 
-                     observacao="", foto_inicial=None, foto_final=None):
-    dados = carregar_dados()
+
+def adicionar_viagem_wrapper(data_viagem, turno, numero_onibus, km_inicial, km_final, observacao, foto_inicial=None, foto_final=None):
+    """Normaliza dados e chama storage.adicionar_viagem.
+
+    Nota: removemos a entrada de passageiros da UI; sempre registramos 0.
+    """
     dt = pd.to_datetime(data_viagem)
-    dia_semana = DIAS_SEMANA[dt.weekday()]
-    mes_nome = MESES[dt.month - 1]
-    novo_id = len(dados) + 1
-
-    foto_inicial_path = None
-    foto_final_path = None
-
-    if foto_inicial is not None:
-        ext = foto_inicial.name.split('.')[-1]
-        foto_inicial_path = salvar_foto(foto_inicial, f"viagem_{novo_id}_inicial.{ext}")
-
-    if foto_final is not None:
-        ext = foto_final.name.split('.')[-1]
-        foto_final_path = salvar_foto(foto_final, f"viagem_{novo_id}_final.{ext}")
-
     viagem = {
-        "id": novo_id,
         "data": str(data_viagem),
-        "dia_semana": dia_semana,
-        "semana_ano": dt.isocalendar()[1],
-        "mes": dt.month,
-        "mes_nome": mes_nome,
-        "ano": dt.year,
+        "dia_semana": DIAS_SEMANA[dt.weekday()],
+        "semana_ano": int(dt.isocalendar()[1]),
+        "mes": int(dt.month),
+        "mes_nome": MESES[dt.month - 1],
+        "ano": int(dt.year),
         "turno": turno,
         "numero_onibus": numero_onibus,
         "km_inicial": float(km_inicial),
         "km_final": float(km_final),
         "km_percorrido": round(float(km_final) - float(km_inicial), 2),
-        "passageiros": int(passageiros),
-        "observacao": observacao,
-        "tem_foto_inicial": foto_inicial_path is not None,
-        "tem_foto_final": foto_final_path is not None,
-        "foto_inicial": foto_inicial_path,
-        "foto_final": foto_final_path,
-        "data_registro": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "passageiros": 0,
+        "observacao": val.sanitizar_texto(observacao),
+        "data_registro": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-    dados.append(viagem)
-    salvar_dados(dados)
-    return viagem
-
-def excluir_viagem(id_viagem):
-    dados = carregar_dados()
-    viagem = next((v for v in dados if v["id"] == id_viagem), None)
-    if viagem:
-        if viagem.get("foto_inicial") and os.path.exists(viagem["foto_inicial"]):
-            os.remove(viagem["foto_inicial"])
-        if viagem.get("foto_final") and os.path.exists(viagem["foto_final"]):
-            os.remove(viagem["foto_final"])
-    dados = [v for v in dados if v["id"] != id_viagem]
-    for i, v in enumerate(dados, 1):
-        v["id"] = i
-    salvar_dados(dados)
-
-def df_viagens():
-    dados = carregar_dados()
-    if not dados:
-        return pd.DataFrame(columns=["id", "data", "dia_semana", "semana_ano", "mes", "mes_nome", "ano", "turno", "numero_onibus", "km_inicial", "km_final", "km_percorrido", "passageiros", "observacao", "tem_foto_inicial", "tem_foto_final"])
-    df = pd.DataFrame(dados)
-    df["data"] = pd.to_datetime(df["data"])
-    return df
+    return storage.adicionar_viagem(viagem, foto_inicial, foto_final)
 
 # ==================== FUNÇÕES DE E-MAIL E ZIP ====================
 
 def verificar_fotos_existentes(df_periodo):
-    """Verifica quais fotos realmente existem no disco"""
-    fotos_existentes = []
-    for _, row in df_periodo.iterrows():
-        if row.get("foto_inicial") and os.path.exists(row["foto_inicial"]):
-            fotos_existentes.append({
-                "id": row["id"],
-                "tipo": "inicial",
-                "caminho": row["foto_inicial"],
-                "onibus": row["numero_onibus"],
-                "data": row["data"]
-            })
-        if row.get("foto_final") and os.path.exists(row["foto_final"]):
-            fotos_existentes.append({
-                "id": row["id"],
-                "tipo": "final",
-                "caminho": row["foto_final"],
-                "onibus": row["numero_onibus"],
-                "data": row["data"]
-            })
-    return fotos_existentes
+    """Retorna lista de fotos: usa D1 quando disponível, senão verifica disco local."""
+    if storage.D1_DISPONIVEL:
+        fotos = []
+        for _, row in df_periodo.iterrows():
+            if row.get("tem_foto_inicial"):
+                fotos.append({"id": row["id"], "tipo": "inicial", "caminho": None, "onibus": row["numero_onibus"], "data": row["data"]})
+            if row.get("tem_foto_final"):
+                fotos.append({"id": row["id"], "tipo": "final", "caminho": None, "onibus": row["numero_onibus"], "data": row["data"]})
+        return fotos
+    return storage.verificar_fotos_existentes_local(df_periodo)
 
 def criar_relatorio_zip(data_inicio=None, data_fim=None, incluir_fotos=True):
-    """Cria um ZIP com relatório Excel + fotos de evidência"""
+    """Wrapper que cria ZIP usando `utils.criar_relatorio_zip`.
+
+    Usa D1 para obter fotos quando disponível; caso contrário usa fotos locais.
+    """
     df = df_viagens()
-
-    if data_inicio and data_fim:
-        df = df[(df["data"].dt.date >= data_inicio) & (df["data"].dt.date <= data_fim)]
-
-    if df.empty:
+    if df is None or df.empty:
         return None, "Nenhum dado para exportar."
 
-    buffer = BytesIO()
+    df_periodo = df
+    if data_inicio and data_fim:
+        df_periodo = df[(df["data"].dt.date >= data_inicio) & (df["data"].dt.date <= data_fim)]
 
-    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # 1. Relatório Excel com múltiplas abas
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            # Aba 1: Viagens completas
-            df.to_excel(writer, sheet_name='Viagens', index=False)
+    if df_periodo.empty:
+        return None, "Nenhum dado para exportar."
 
-            # Aba 2: Resumo por Dia e Turno
-            resumo_dia_turno = df.groupby([df["data"].dt.date, "turno"]).agg({
-                "km_percorrido": "sum",
-                "passageiros": "sum",
-                "numero_onibus": "nunique",
-                "id": "count"
-            }).rename(columns={"numero_onibus": "onibus_unicos", "id": "viagens"})
-            resumo_dia_turno.columns = ["KM Total", "Passageiros", "Ônibus Únicos", "Viagens"]
-            resumo_dia_turno.to_excel(writer, sheet_name='Resumo Dia-Turno')
-
-            # Aba 3: Resumo por Ônibus
-            resumo_onibus = df.groupby("numero_onibus").agg({
-                "km_percorrido": ["sum", "mean", "count"],
-                "passageiros": "sum",
-                "data": ["min", "max"]
-            })
-            resumo_onibus.columns = ["KM Total", "KM Médio", "Viagens", "Passageiros", "Primeira Viagem", "Última Viagem"]
-            resumo_onibus.sort_values("KM Total", ascending=False).to_excel(writer, sheet_name='Resumo Ônibus')
-
-            # Aba 4: Resumo Mensal
-            resumo_mensal = df.groupby(["mes", "mes_nome"]).agg({
-                "km_percorrido": ["sum", "mean"],
-                "passageiros": ["sum", "mean"],
-                "numero_onibus": "nunique",
-                "id": "count"
-            })
-            resumo_mensal.columns = ["KM Total", "KM Médio/Viagem", "Passageiros", "Pass Médio/Viagem", "Ônibus Únicos", "Total Viagens"]
-            resumo_mensal.reset_index().set_index("mes_nome").to_excel(writer, sheet_name='Resumo Mensal')
-
-            # Aba 5: Resumo por Dia da Semana
-            resumo_dia_sem = df.groupby("dia_semana").agg({
-                "km_percorrido": ["sum", "mean"],
-                "passageiros": ["sum", "mean"],
-                "id": "count"
-            })
-            resumo_dia_sem.columns = ["KM Total", "KM Médio", "Pass Total", "Pass Médio", "Viagens"]
-            resumo_dia_sem.to_excel(writer, sheet_name='Resumo Dia Semana')
-
-        zf.writestr("relatorio_km.xlsx", excel_buffer.getvalue())
-
-        # 2. Fotos de evidência (SEMPRE verificar se existem)
-        if incluir_fotos:
-            fotos_encontradas = verificar_fotos_existentes(df)
-
-            if fotos_encontradas:
-                # Criar índice de fotos
-                indice_fotos = []
-                for foto in fotos_encontradas:
-                    nome_arquivo = f"viagem_{foto['id']}_{foto['tipo']}_{os.path.basename(foto['caminho'])}"
-                    zf.write(foto['caminho'], f"fotos_evidencias/{nome_arquivo}")
-                    indice_fotos.append({
-                        "Viagem ID": foto['id'],
-                        "Data": foto['data'].strftime('%d/%m/%Y') if hasattr(foto['data'], 'strftime') else str(foto['data']),
-                        "Ônibus": foto['onibus'],
-                        "Tipo": "KM Inicial" if foto['tipo'] == "inicial" else "KM Final",
-                        "Arquivo": nome_arquivo
-                    })
-
-                # Adicionar índice de fotos como CSV dentro do ZIP
-                if indice_fotos:
-                    df_indice = pd.DataFrame(indice_fotos)
-                    zf.writestr("fotos_evidencias/INDICE_FOTOS.csv", df_indice.to_csv(index=False))
-            else:
-                zf.writestr("fotos_evidencias/README.txt", 
-                    "Nenhuma foto de evidência foi encontrada para o período selecionado.\n\n"
-                    "Possíveis motivos:\n"
-                    "1. As viagens não tinham fotos anexadas\n"
-                    "2. As fotos foram perdidas devido a reinicialização do servidor (modo cloud)\n"
-                    "3. O período selecionado não possui registros com fotos\n\n"
-                    "DICA: No modo cloud, envie o relatório imediatamente após cadastrar as fotos!"
-                )
-
-    buffer.seek(0)
-    return buffer, None
+    if storage.D1_DISPONIVEL:
+        return utils.criar_relatorio_zip(df_periodo, data_inicio, data_fim, incluir_fotos, fotos_d1_fn=storage.buscar_foto_d1, fotos_locais=None)
+    else:
+        fotos_locais = storage.verificar_fotos_existentes_local(df_periodo)
+        return utils.criar_relatorio_zip(df_periodo, data_inicio, data_fim, incluir_fotos, fotos_d1_fn=None, fotos_locais=fotos_locais)
 
 def enviar_email(destinatario, assunto, corpo, anexo_buffer=None, anexo_nome="relatorio.zip",
                  smtp_server="smtp.gmail.com", smtp_port=587, email_remetente=None, senha_app=None):
-    """Envia e-mail com anexo ZIP"""
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = email_remetente
-        msg['To'] = destinatario
-        msg['Subject'] = assunto
-
-        msg.attach(MIMEText(corpo, 'plain', 'utf-8'))
-
-        if anexo_buffer:
-            part = MIMEBase('application', 'zip')
-            part.set_payload(anexo_buffer.getvalue())
-            encoders.encode_base64(part)
-            part.add_header('Content-Disposition', f'attachment; filename= {anexo_nome}')
-            msg.attach(part)
-
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-        server.login(email_remetente, senha_app)
-        server.send_message(msg)
-        server.quit()
-
-        return True, "E-mail enviado com sucesso!"
-    except Exception as e:
-        return False, f"Erro ao enviar e-mail: {str(e)}"
+    """Wrapper que usa `email_service.enviar_email` com credenciais de ambiente ou entrada temporária."""
+    config = carregar_config_email()
+    remetente = (email_remetente or config.get("email") or os.environ.get("SMTP_EMAIL", "")).strip()
+    senha = (senha_app or os.environ.get("SMTP_PASSWORD", "")).strip()
+    return email_service.enviar_email(destinatario, assunto, corpo, anexo_buffer, anexo_nome, smtp_server, smtp_port, remetente, senha)
 
 # ==================== FUNÇÕES DE ANÁLISE TEMPORAL ====================
 
@@ -424,7 +290,6 @@ elif pagina == "➕ Nova Viagem":
         with col2:
             km_inicial = st.number_input("📍 KM Inicial", min_value=0.0, step=0.1, format="%.1f")
             km_final = st.number_input("🏁 KM Final", min_value=0.0, step=0.1, format="%.1f")
-            passageiros = st.number_input("👥 Quantidade de Passageiros", min_value=0, step=1)
         observacao = st.text_area("📝 Observação (opcional)", placeholder="Alguma observação sobre a viagem...")
         st.markdown("---")
         st.markdown("### 📸 Fotos de Evidência (IMPORTANTE - Serão enviadas por e-mail)")
@@ -442,14 +307,51 @@ elif pagina == "➕ Nova Viagem":
         elif km_final > 0 and km_final <= km_inicial: st.warning("⚠️ KM Final deve ser maior que KM Inicial!")
         submitted = st.form_submit_button("✅ Salvar Viagem", use_container_width=True)
         if submitted:
-            if not numero_onibus: st.error("❌ Informe o número do ônibus!")
-            elif km_final <= km_inicial: st.error("❌ KM Final deve ser maior que KM Inicial!")
+            if not numero_onibus:
+                st.error("❌ Informe o número do ônibus!")
+            elif km_final <= km_inicial:
+                st.error("❌ KM Final deve ser maior que KM Inicial!")
             else:
-                viagem = adicionar_viagem(data_viagem, turno, numero_onibus, km_inicial, km_final, passageiros, observacao, foto_inicial, foto_final)
-                msg_foto = ""
-                if viagem["tem_foto_inicial"]: msg_foto += " 📸 Foto inicial salva!"
-                if viagem["tem_foto_final"]: msg_foto += " 📸 Foto final salva!"
-                st.success(f"✅ Viagem #{viagem['id']} registrada!{msg_foto}")
+                ok_onibus, msg_onibus, numero_ok = val.validar_numero_onibus(numero_onibus)
+                if not ok_onibus:
+                    st.error(f"❌ {msg_onibus}")
+                else:
+                    ok_data, msg_data = val.validar_data(data_viagem)
+                    if not ok_data:
+                        st.error(f"❌ {msg_data}")
+                    else:
+                        ok_km, msg_km = val.validar_km(km_inicial, km_final)
+                        if not ok_km:
+                            st.error(f"❌ {msg_km}")
+                        else:
+                            # verificar duplicidade
+                            dados = carregar_dados()
+                            dup, msg_dup = val.verificar_duplicidade(dados, numero_ok, data_viagem, km_inicial)
+                            if dup:
+                                st.error(f"❌ {msg_dup}")
+                            else:
+                                # validar uploads
+                                ok_fi, msg_fi = val.validar_upload_foto(foto_inicial)
+                                ok_ff, msg_ff = val.validar_upload_foto(foto_final)
+                                if not ok_fi:
+                                    st.error(f"❌ Foto inicial: {msg_fi}")
+                                elif not ok_ff:
+                                    st.error(f"❌ Foto final: {msg_ff}")
+                                else:
+                                    # em D1 validar tamanho
+                                    if storage.D1_DISPONIVEL:
+                                        ok_d1_fi, msg_d1_fi = val.validar_foto_d1(foto_inicial)
+                                        ok_d1_ff, msg_d1_ff = val.validar_foto_d1(foto_final)
+                                        if not ok_d1_fi:
+                                            st.warning(msg_d1_fi)
+                                        if not ok_d1_ff:
+                                            st.warning(msg_d1_ff)
+
+                                    viagem = adicionar_viagem_wrapper(data_viagem, turno, numero_ok, km_inicial, km_final, observacao, foto_inicial, foto_final)
+                                    msg_foto = ""
+                                    if viagem.get("tem_foto_inicial"): msg_foto += " 📸 Foto inicial salva!"
+                                    if viagem.get("tem_foto_final"): msg_foto += " 📸 Foto final salva!"
+                                    st.success(f"✅ Viagem #{viagem['id']} registrada!{msg_foto}")
                 st.markdown("""
                 <div class="success-box">
                 <strong>✅ Viagem salva com sucesso!</strong><br>
@@ -609,7 +511,12 @@ elif pagina == "📧 Enviar por E-mail":
             st.success(f"✅ {len(fotos_disp)} fotos de evidência encontradas no servidor e prontas para envio!")
             with st.expander("Ver lista de fotos disponíveis"):
                 for f in fotos_disp:
-                    st.write(f"   • Viagem #{f['id']} - {f['onibus']} - {f['tipo']} - {os.path.basename(f['caminho'])}")
+                    caminho = f.get('caminho')
+                    if caminho:
+                        nome_arq = os.path.basename(caminho)
+                    else:
+                        nome_arq = "(armazenada no D1)" if storage.D1_DISPONIVEL else "(caminho não disponível)"
+                    st.write(f"   • Viagem #{f['id']} - {f['onibus']} - {f['tipo']} - {nome_arq}")
         else:
             st.error("❌ NENHUMA foto encontrada no servidor!")
             st.info("💡 Se você acabou de cadastrar fotos, elas ainda estão aqui. Envie o relatório AGORA antes que o app reinicie!")
@@ -715,7 +622,9 @@ O ZIP contém:
 Relatório gerado automaticamente pelo sistema de controle de KM.
 """
 
-                            sucesso, msg = enviar_email(destinatario, assunto, corpo, zip_buffer, f"relatorio_km_{data_inicio}_{data_fim}.zip", config.get("smtp", "smtp.gmail.com"), config.get("porta", 587), config.get("email"), config.get("senha"))
+                            # senha_app pode ter sido digitada temporariamente na configuração acima
+                            senha_para_envio = locals().get('senha_app') or None
+                            sucesso, msg = enviar_email(destinatario, assunto, corpo, zip_buffer, f"relatorio_km_{data_inicio}_{data_fim}.zip", config.get("smtp", "smtp.gmail.com"), config.get("porta", 587), config.get("email"), senha_para_envio)
                             if sucesso:
                                 st.success(f"✅ {msg}")
                                 st.markdown("""
@@ -787,14 +696,40 @@ elif pagina == "🗂️ Dados Completos":
                         if viagem_completa.get("foto_inicial") and os.path.exists(viagem_completa["foto_inicial"]):
                             st.markdown("**📷 Foto KM Inicial:**")
                             st.image(viagem_completa["foto_inicial"], use_container_width=True)
-                        elif viagem_completa.get("tem_foto_inicial"): st.warning("📷 Foto inicial não encontrada no disco.")
-                        else: st.info("Sem foto do KM inicial.")
+                        elif viagem_completa.get("tem_foto_inicial") and storage.D1_DISPONIVEL:
+                            st.markdown("**📷 Foto KM Inicial (D1):**")
+                            try:
+                                img_bytes, ext = storage.buscar_foto_d1(viagem_completa["id"], "inicial")
+                                if img_bytes:
+                                    img = Image.open(BytesIO(img_bytes))
+                                    st.image(img, use_container_width=True)
+                                else:
+                                    st.warning("📷 Foto inicial registrada no D1, mas não encontrada.")
+                            except Exception:
+                                st.warning("Erro ao recuperar foto inicial do D1.")
+                        elif viagem_completa.get("tem_foto_inicial"):
+                            st.warning("📷 Foto inicial não encontrada no disco.")
+                        else:
+                            st.info("Sem foto do KM inicial.")
                     with col_foto2:
                         if viagem_completa.get("foto_final") and os.path.exists(viagem_completa["foto_final"]):
                             st.markdown("**📷 Foto KM Final:**")
                             st.image(viagem_completa["foto_final"], use_container_width=True)
-                        elif viagem_completa.get("tem_foto_final"): st.warning("📷 Foto final não encontrada no disco.")
-                        else: st.info("Sem foto do KM final.")
+                        elif viagem_completa.get("tem_foto_final") and storage.D1_DISPONIVEL:
+                            st.markdown("**📷 Foto KM Final (D1):**")
+                            try:
+                                img_bytes, ext = storage.buscar_foto_d1(viagem_completa["id"], "final")
+                                if img_bytes:
+                                    img = Image.open(BytesIO(img_bytes))
+                                    st.image(img, use_container_width=True)
+                                else:
+                                    st.warning("📷 Foto final registrada no D1, mas não encontrada.")
+                            except Exception:
+                                st.warning("Erro ao recuperar foto final do D1.")
+                        elif viagem_completa.get("tem_foto_final"):
+                            st.warning("📷 Foto final não encontrada no disco.")
+                        else:
+                            st.info("Sem foto do KM final.")
             if st.button("🗑️ Excluir Viagem", key=f"del_{row['id']}"):
                 excluir_viagem(row['id'])
                 st.success(f"Viagem #{row['id']} e fotos associadas excluídas!")
@@ -807,7 +742,7 @@ elif pagina == "🗂️ Dados Completos":
                 for v in dados:
                     if v.get("foto_inicial") and os.path.exists(v["foto_inicial"]): os.remove(v["foto_inicial"])
                     if v.get("foto_final") and os.path.exists(v["foto_final"]): os.remove(v["foto_final"])
-                salvar_dados([])
+                storage.excluir_todos_viagens()
                 st.success("Todos os dados e fotos foram removidos!")
                 st.rerun()
 
